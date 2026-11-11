@@ -41,15 +41,13 @@ public sealed class Appointment
         this.now = now;
     }
 
-    public void Start()
+    // начало проходит через Clinic, где проверяется занятость врача, пациента и кабинета
+    internal void Start(DateTime startedAt)
     {
         if (Status != AppointmentStatus.PLANNED)
             throw new InvalidOperationException("Начать можно только запланированный прием.");
 
-        if (Patient.Appointments.Any(a => a.Status == AppointmentStatus.IN_PROGRESS))
-            throw new InvalidOperationException("У пациента уже идет другой прием.");
-
-        StartedAt = now();
+        StartedAt = startedAt;
         Status = AppointmentStatus.IN_PROGRESS;
     }
 

@@ -137,18 +137,149 @@ Run("Чужую запись нельзя отменить или открыть
     var appointment = clinic.BookAppointment(patient.Id, 1);
     var doctor = clinic.AddDoctor("Другой врач", "Хирургия", 20);
     Expect<InvalidOperationException>(() => clinic.OpenAppointment(doctor.Id, appointment.Id));
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, appointment.Id));
     Expect<KeyNotFoundException>(() => clinic.CancelAppointment(anotherPatient.Id, appointment.Id));
     Check(appointment.Status == AppointmentStatus.PLANNED, "Запись изменилась.");
 });
 
+Run("Прием нельзя начать в другой день, неуспешный старт не меняет запись", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, _, day) = CreateScenario(() => clock);
+    var appointment = clinic.BookAppointment(patient.Id, 1);
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, appointment.Id));
+    clock = day.AddDays(1);
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, appointment.Id));
+    Check(appointment.Status == AppointmentStatus.PLANNED && appointment.StartedAt is null,
+        "После отказа изменились статус или время начала.");
+});
+
+Run("В назначенный день прием можно начать раньше слота и получить тот же объект", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, _, day) = CreateScenario(() => clock);
+    var appointment = clinic.BookAppointment(patient.Id, 1);
+    clock = day.AddMinutes(-10);
+    var started = clinic.StartAppointment(doctor.Id, appointment.Id);
+    Check(ReferenceEquals(started, appointment), "Создана копия приема.");
+    Check(started.Status == AppointmentStatus.IN_PROGRESS && started.StartedAt == clock,
+        "Не сохранено фактическое время начала.");
+});
+
+Run("Врач не может начать следующий прием, пока не завершит предыдущий", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, 2);
+    clock = day;
+    clinic.StartAppointment(doctor.Id, first.Id);
+    clock = day.AddMinutes(30);
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, second.Id));
+    Check(second.Status == AppointmentStatus.PLANNED && second.StartedAt is null, "Отказ изменил второй прием.");
+    first.SetExamination("Жалобы", "", "Осмотр");
+    first.SetDiagnosis("R69");
+    first.Complete();
+    clinic.StartAppointment(doctor.Id, second.Id);
+    Check(second.StartedAt == clock, "Следующий прием не начался после завершения предыдущего.");
+});
+
+Run("Пациент не может участвовать в двух приемах разных врачей одновременно", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, _, day) = CreateScenario(() => clock);
+    var anotherDoctor = clinic.AddDoctor("Хирург", "Хирургия", 20);
+    var anotherSlot = clinic.CreateSchedule(anotherDoctor.Id, "102", day, day.AddMinutes(20))[0];
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(patient.Id, anotherSlot.Id);
+    clock = day;
+    clinic.StartAppointment(doctor.Id, first.Id);
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(anotherDoctor.Id, second.Id));
+    Check(second.Status == AppointmentStatus.PLANNED && second.StartedAt is null, "Отказ изменил второй прием.");
+});
+
+Run("Затянувшийся прием блокирует кабинет для следующего врача", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var anotherDoctor = clinic.AddDoctor("Хирург", "Хирургия", 20);
+    var anotherSlot = clinic.CreateSchedule(anotherDoctor.Id, "101", day.AddHours(1), day.AddMinutes(80))[0];
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, anotherSlot.Id);
+    clock = day;
+    clinic.StartAppointment(doctor.Id, first.Id);
+    clock = day.AddHours(1);
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(anotherDoctor.Id, second.Id));
+    Check(second.Status == AppointmentStatus.PLANNED && second.StartedAt is null, "Отказ изменил второй прием.");
+    first.SetExamination("Жалобы", "", "Осмотр");
+    first.SetDiagnosis("R69");
+    first.Complete();
+    clinic.StartAppointment(anotherDoctor.Id, second.Id);
+    Check(second.Status == AppointmentStatus.IN_PROGRESS, "Кабинет остался занят после завершения приема.");
+});
+
+Run("Независимые приемы разных врачей в разных кабинетах могут идти одновременно", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var anotherDoctor = clinic.AddDoctor("Хирург", "Хирургия", 20);
+    var anotherSlot = clinic.CreateSchedule(anotherDoctor.Id, "102", day, day.AddMinutes(20))[0];
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, anotherSlot.Id);
+    clock = day;
+    clinic.StartAppointment(doctor.Id, first.Id);
+    clinic.StartAppointment(anotherDoctor.Id, second.Id);
+    Check(first.Status == AppointmentStatus.IN_PROGRESS && second.Status == AppointmentStatus.IN_PROGRESS,
+        "Независимые приемы блокируют друг друга.");
+});
+
+Run("Отмененный, завершенный и отсутствующий прием нельзя начать", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, _, day) = CreateScenario(() => clock);
+    var cancelled = clinic.BookAppointment(patient.Id, 1);
+    clinic.CancelAppointment(patient.Id, cancelled.Id);
+    var completed = clinic.BookAppointment(patient.Id, 2);
+    clock = day;
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, cancelled.Id));
+    Expect<KeyNotFoundException>(() => clinic.StartAppointment(doctor.Id, int.MaxValue));
+    clinic.StartAppointment(doctor.Id, completed.Id);
+    completed.SetExamination("Жалобы", "", "Осмотр");
+    completed.SetDiagnosis("R69");
+    completed.Complete();
+    var startedAt = completed.StartedAt;
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, completed.Id));
+    Check(cancelled.Status == AppointmentStatus.CANCELLED && completed.Status == AppointmentStatus.COMPLETED &&
+        completed.StartedAt == startedAt, "Повторное начало изменило историю.");
+});
+
+Run("Параллельные попытки начать приемы одного врача запускают только один", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, 2);
+    clock = day;
+    var started = new ConcurrentBag<Appointment>();
+    Parallel.ForEach(new[] { first, second }, appointment =>
+    {
+        try { started.Add(clinic.StartAppointment(doctor.Id, appointment.Id)); }
+        catch (InvalidOperationException) { }
+    });
+    Check(started.Count == 1 && new[] { first, second }.Count(a => a.Status == AppointmentStatus.IN_PROGRESS) == 1,
+        "У врача начались два приема.");
+});
+
 Run("Прием требует начала, жалоб, осмотра и диагноза", () =>
 {
-    var (clinic, _, patient, _, _) = CreateScenario();
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, _, day) = CreateScenario(() => clock);
     var appointment = clinic.BookAppointment(patient.Id, 1);
     Expect<InvalidOperationException>(() => appointment.SetDiagnosis("R69"));
     Expect<InvalidOperationException>(() => appointment.Complete());
-    appointment.Start();
-    Expect<InvalidOperationException>(() => appointment.Start());
+    clock = day;
+    clinic.StartAppointment(doctor.Id, appointment.Id);
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, appointment.Id));
     Expect<InvalidOperationException>(() => appointment.Complete());
     appointment.SetExamination("Жалобы", "", "Осмотр");
     Expect<InvalidOperationException>(() => appointment.Complete());
@@ -159,9 +290,11 @@ Run("Прием требует начала, жалоб, осмотра и ди�
 
 Run("Черновик не входит в историю, завершенный прием нельзя менять", () =>
 {
-    var (clinic, _, patient, _, _) = CreateScenario();
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, _, day) = CreateScenario(() => clock);
     var appointment = clinic.BookAppointment(patient.Id, 1);
-    appointment.Start();
+    clock = day;
+    clinic.StartAppointment(doctor.Id, appointment.Id);
     appointment.SetExamination("Жалобы", "Анамнез", "Осмотр");
     appointment.SetDiagnosis("R69");
     Check(patient.GetMedicalHistory().Count == 0, "Черновик попал в историю.");
@@ -186,7 +319,7 @@ Run("Два приема сохраняются раздельно, кабине
         var slot = clinic.CreateSchedule(doctor.Id, $"10{i}", start, start.AddMinutes(20))[0];
         var appointment = clinic.BookAppointment(patient.Id, slot.Id);
         clock = start;
-        appointment.Start();
+        clinic.StartAppointment(doctor.Id, appointment.Id);
         appointment.SetExamination($"Жалобы {i}", "", $"Осмотр {i}");
         appointment.SetDiagnosis(i == 1 ? "R69" : "R51");
         clock = clock.AddMinutes(10);
@@ -252,10 +385,10 @@ static void Expect<T>(Action action) where T : Exception
     throw new Exception($"Ожидалось исключение {typeof(T).Name}.");
 }
 
-static (Clinic Clinic, Doctor Doctor, Patient Patient, Patient AnotherPatient, DateTime Day) CreateScenario()
+static (Clinic Clinic, Doctor Doctor, Patient Patient, Patient AnotherPatient, DateTime Day) CreateScenario(Func<DateTime>? now = null)
 {
     var time = new DateTime(2030, 1, 10, 8, 0, 0);
-    var clinic = new Clinic(() => time);
+    var clinic = new Clinic(now ?? (() => time));
     var doctor = clinic.AddDoctor("Врач", "Терапия", 20);
     var patient = clinic.AddPatient("Первый пациент", new DateOnly(1990, 1, 1), "0000000000000001");
     var anotherPatient = clinic.AddPatient("Второй пациент", new DateOnly(1991, 1, 1), "0000000000000002");

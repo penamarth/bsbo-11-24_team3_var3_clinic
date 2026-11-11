@@ -42,8 +42,7 @@ catch (InvalidOperationException error)
 
 // Врач один раз получает объект приема, затем работает с ним локально.
 currentTime = firstSlot.Start;
-var appointment = clinic.OpenAppointment(doctor.Id, booking.Id);
-appointment.Start();
+var appointment = clinic.StartAppointment(doctor.Id, booking.Id);
 appointment.SetExamination("Учебный пример жалоб", "Учебный анамнез", "Учебное описание осмотра");
 appointment.SetDiagnosis("R69");
 appointment.AddPrescription("Учебное назначение для демонстрации хранения данных.");
@@ -65,7 +64,7 @@ catch (InvalidOperationException error)
 var secondSlot = clinic.FindFreeSlots("Терапия", DateOnly.FromDateTime(firstDay.AddDays(1)))[0];
 var secondAppointment = clinic.BookAppointment(patient.Id, secondSlot.Id);
 currentTime = secondSlot.Start;
-clinic.OpenAppointment(doctor.Id, secondAppointment.Id).Start();
+clinic.StartAppointment(doctor.Id, secondAppointment.Id);
 secondAppointment.SetExamination("Жалобы второго приема", "Анамнез второго приема", "Осмотр второго приема");
 secondAppointment.SetDiagnosis("R51");
 currentTime = currentTime.AddMinutes(15);

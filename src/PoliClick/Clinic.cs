@@ -105,6 +105,31 @@ public sealed class Clinic
         return appointment;
     }
 
+    public Appointment StartAppointment(int doctorId, int appointmentId)
+    {
+        lock (bookingLock)
+        {
+            var appointment = OpenAppointment(doctorId, appointmentId);
+            if (appointment.Status != AppointmentStatus.PLANNED)
+                throw new InvalidOperationException("Начать можно только запланированный прием.");
+
+            var currentTime = now();
+            if (appointment.Slot.Start.Date != currentTime.Date)
+                throw new InvalidOperationException("Прием можно начать только в назначенный день.");
+
+            var inProgress = appointments.Where(a => a.Status == AppointmentStatus.IN_PROGRESS);
+            if (inProgress.Any(a => a.Doctor.Id == doctorId))
+                throw new InvalidOperationException("У врача уже идет другой прием.");
+            if (inProgress.Any(a => a.Patient.Id == appointment.Patient.Id))
+                throw new InvalidOperationException("У пациента уже идет другой прием.");
+            if (inProgress.Any(a => a.CabinetNumber == appointment.CabinetNumber))
+                throw new InvalidOperationException("В кабинете еще идет другой прием.");
+
+            appointment.Start(currentTime);
+            return appointment;
+        }
+    }
+
     public void CancelAppointment(int patientId, int appointmentId)
     {
         lock (bookingLock)
