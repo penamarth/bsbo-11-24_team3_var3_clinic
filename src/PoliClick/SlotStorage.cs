@@ -39,6 +39,18 @@ public sealed class SlotStorage
     internal TimeSlot GetSlot(int slotId) => slots.FirstOrDefault(s => s.Id == slotId)
         ?? throw new KeyNotFoundException("Слот не найден.");
 
+    public IReadOnlyList<DateOnly> GetFreeDates(string specialty, DateTime after, DateOnly dateTo,
+        int? doctorId = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(specialty);
+        return slots.Where(s => s.IsFree && s.Start > after && DateOnly.FromDateTime(s.Start) <= dateTo &&
+                string.Equals(s.Doctor.Specialty, specialty.Trim(), StringComparison.OrdinalIgnoreCase) &&
+                (doctorId is null || s.Doctor.Id == doctorId))
+            .Select(s => DateOnly.FromDateTime(s.Start))
+            .Distinct().OrderBy(date => date)
+            .ToList().AsReadOnly();
+    }
+
     public IReadOnlyList<TimeSlot> FindFreeSlots(string specialty, DateOnly date, int? doctorId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(specialty);

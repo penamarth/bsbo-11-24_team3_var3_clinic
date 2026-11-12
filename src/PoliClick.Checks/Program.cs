@@ -6,6 +6,109 @@ Console.OutputEncoding = Encoding.UTF8;
 var failed = 0;
 var passed = 0;
 
+Run("Специальности не повторяются, врачи отбираются по специальности и сортируются по ФИО", () =>
+{
+    var (clinic, doctor, _, _, _) = CreateScenario();
+    var anotherDoctor = clinic.AddDoctor("Абрамов Алексей", "терапия", 20);
+    clinic.AddDoctor("Хирург", "Хирургия", 30);
+    Check(clinic.GetSpecialties().SequenceEqual(new[] { "Терапия", "Хирургия" }), "Специальности повторяются или не отсортированы.");
+    var doctors = clinic.GetDoctors(" терапия ");
+    Check(doctors.Count == 2 && doctors[0] == anotherDoctor && doctors[1] == doctor,
+        "Не учтены специальность, пробелы, регистр или порядок ФИО.");
+});
+
+Run("Дни свободного приема не повторяются и отсортированы", () =>
+{
+    var (clinic, doctor, _, _, day) = CreateScenario();
+    var anotherDoctor = clinic.AddDoctor("Другой врач", "Терапия", 20);
+    clinic.CreateSchedule(doctor.Id, "101", day.AddDays(2), day.AddDays(2).AddMinutes(20));
+    clinic.CreateSchedule(anotherDoctor.Id, "102", day, day.AddHours(1));
+    clinic.CreateSchedule(doctor.Id, "101", day.AddDays(-1), day.AddDays(-1).AddMinutes(20));
+    var dates = clinic.GetFreeDates(" терапия ");
+    Check(dates.SequenceEqual(new[] { DateOnly.FromDateTime(day.AddDays(-1)), DateOnly.FromDateTime(day),
+        DateOnly.FromDateTime(day.AddDays(2)) }), "Дни повторяются, не отсортированы или потеряны.");
+});
+
+Run("Поиск по ФИО ограничивает дни и время выбранным врачом", () =>
+{
+    var (clinic, doctor, _, _, day) = CreateScenario();
+    var anotherDoctor = clinic.AddDoctor("Другой врач", "Терапия", 20);
+    clinic.CreateSchedule(anotherDoctor.Id, "102", day.AddDays(1), day.AddDays(1).AddHours(1));
+    var firstDate = DateOnly.FromDateTime(day);
+    var secondDate = firstDate.AddDays(1);
+    Check(clinic.GetFreeDates("Терапия").SequenceEqual(new[] { firstDate, secondDate }), "Поиск по дате потерял врачей.");
+    Check(clinic.GetFreeDates("Терапия", doctor.Id).SequenceEqual(new[] { firstDate }), "Подмешаны дни другого врача.");
+    Check(clinic.GetFreeDates("Терапия", anotherDoctor.Id).SequenceEqual(new[] { secondDate }), "Неверные дни выбранного врача.");
+    Check(clinic.FindFreeSlots("Терапия", firstDate, anotherDoctor.Id).Count == 0, "Подмешано чужое время.");
+    var slots = clinic.FindFreeSlots("Терапия", secondDate, anotherDoctor.Id);
+    Check(slots.Count == 3 && slots.All(s => s.Doctor == anotherDoctor), "Потерян фильтр врача.");
+    Check(clinic.GetFreeDates("Хирургия", anotherDoctor.Id).Count == 0, "Потерян фильтр специальности.");
+});
+
+Run("Полностью занятый день исчезает из выбора и возвращается после отмены", () =>
+{
+    var (clinic, _, patient, anotherPatient, day) = CreateScenario();
+    var third = clinic.AddPatient("Третий пациент", new DateOnly(1990, 1, 1), "0000000000000003");
+    var appointment = clinic.BookAppointment(patient.Id, 1);
+    clinic.BookAppointment(anotherPatient.Id, 2);
+    clinic.BookAppointment(third.Id, 3);
+    Check(clinic.GetFreeDates("Терапия").Count == 0, "Занятый день остался доступен.");
+    clinic.CancelAppointment(patient.Id, appointment.Id);
+    Check(clinic.GetFreeDates("Терапия").SequenceEqual(new[] { DateOnly.FromDateTime(day) }), "Освободившийся день не появился.");
+});
+
+Run("Доступные дни учитывают текущее время и включают весь последний день горизонта", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, _, _, _) = CreateScenario(() => clock);
+    var todaySlot = clock.Date.AddHours(9);
+    var last = clock.Date.AddDays(14).AddHours(23);
+    clinic.CreateSchedule(doctor.Id, "101", todaySlot, todaySlot.AddMinutes(20));
+    clinic.CreateSchedule(doctor.Id, "101", last, last.AddMinutes(20));
+    clinic.CreateSchedule(doctor.Id, "101", last.AddDays(1), last.AddDays(1).AddMinutes(20));
+    clock = todaySlot;
+    var dates = clinic.GetFreeDates("Терапия");
+    Check(!dates.Contains(DateOnly.FromDateTime(todaySlot)), "Слот с наступившим началом попал в выбор дней.");
+    Check(dates.Contains(DateOnly.FromDateTime(last)), "Последний день недоступен.");
+    Check(!dates.Contains(DateOnly.FromDateTime(last.AddDays(1))), "Горизонт записи превышен.");
+    Check(dates.All(date => clinic.FindFreeSlots("Терапия", date).Count > 0), "Доступный день не содержит свободного времени.");
+});
+
+Run("Пустые результаты и некорректная специальность обрабатываются при начальном выборе", () =>
+{
+    Check(new Clinic().GetSpecialties().Count == 0, "В пустой поликлинике появились специальности.");
+    var (clinic, _, _, _, _) = CreateScenario();
+    Check(clinic.GetDoctors("Нет такой специальности").Count == 0, "Найдены посторонние врачи.");
+    Check(clinic.GetFreeDates("Нет такой специальности").Count == 0, "Найдены посторонние дни.");
+    Check(clinic.GetFreeDates("Терапия", int.MaxValue).Count == 0, "Найдены дни неизвестного врача.");
+    Expect<ArgumentException>(() => clinic.GetDoctors(" "));
+    Expect<ArgumentException>(() => clinic.GetFreeDates(" "));
+});
+
+Run("Хранилища сохраняют объекты и не добавляют пациента с повторным полисом", () =>
+{
+    var (clinic, doctor, patient, anotherPatient, _) = CreateScenario();
+    Check(ReferenceEquals(clinic.Patients[0], patient) && ReferenceEquals(clinic.Doctors[0], doctor),
+        "Хранилища вернули копии объектов.");
+    Expect<InvalidOperationException>(() => clinic.AddPatient("Дубликат", patient.BirthDate, patient.PolicyNumber));
+    var third = clinic.AddPatient("Третий пациент", new DateOnly(1992, 1, 1), "0000000000000003");
+    Check(clinic.Patients.Count == 3 && third.Id != patient.Id && third.Id != anotherPatient.Id,
+        "Дубликат изменил коллекцию или идентификаторы повторились.");
+    var appointment = clinic.BookAppointment(third.Id, 1);
+    Check(ReferenceEquals(appointment.Patient, third), "Запись использует другого пациента.");
+});
+
+Run("Поиск отсутствующего пациента и врача не меняет данные", () =>
+{
+    var (clinic, _, patient, anotherPatient, day) = CreateScenario();
+    Expect<KeyNotFoundException>(() => clinic.BookAppointment(int.MaxValue, 1));
+    Expect<KeyNotFoundException>(() => clinic.CancelAppointment(int.MaxValue, 1));
+    Expect<KeyNotFoundException>(() => clinic.CreateSchedule(int.MaxValue, "102", day, day.AddHours(1)));
+    Check(clinic.Schedule.Slots.Count == 3 && clinic.Schedule.Slots.All(s => s.IsFree) &&
+        patient.Appointments.Count == 0 && anotherPatient.Appointments.Count == 0,
+        "Неуспешный поиск изменил расписание или записи.");
+});
+
 Run("Нарезка рабочего интервала", () =>
 {
     var (clinic, doctor, _, _, day) = CreateScenario();

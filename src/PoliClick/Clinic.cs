@@ -4,15 +4,15 @@ namespace PoliClick;
 // для последовательной консоли он излишен
 public sealed class Clinic
 {
-    private readonly List<Patient> patients = [];
-    private readonly List<Doctor> doctors = [];
+    private readonly PatientStorage patientStorage = new();
+    private readonly DoctorStorage doctorStorage = new();
     private readonly List<Appointment> appointments = [];
     private readonly Func<DateTime> now;
     private readonly object bookingLock = new();
 
     public SlotStorage Schedule { get; } = new();
-    public IReadOnlyList<Patient> Patients => patients.AsReadOnly();
-    public IReadOnlyList<Doctor> Doctors => doctors.AsReadOnly();
+    public IReadOnlyList<Patient> Patients => patientStorage.Patients;
+    public IReadOnlyList<Doctor> Doctors => doctorStorage.Doctors;
 
     // подмена времени нужна для демонстрации и проверок без реального ожидания
     public Clinic(Func<DateTime>? now = null) => this.now = now ?? (() => DateTime.Now);
@@ -21,33 +21,31 @@ public sealed class Clinic
     {
         if (birthDate > DateOnly.FromDateTime(now()))
             throw new ArgumentException("Дата рождения не может быть в будущем.", nameof(birthDate));
-        if (patients.Any(p => p.PolicyNumber == policyNumber))
-            throw new InvalidOperationException("Пациент с таким полисом уже есть.");
-
-        var patient = new Patient(patients.Count + 1, fullName, birthDate, policyNumber, isAttached);
-        patients.Add(patient);
-        return patient;
+        return patientStorage.AddPatient(fullName, birthDate, policyNumber, isAttached);
     }
 
-    public Doctor AddDoctor(string fullName, string specialty, int slotMinutes)
-    {
-        var doctor = new Doctor(doctors.Count + 1, fullName, specialty, slotMinutes);
-        if (doctors.Any(d => string.Equals(d.Specialty, doctor.Specialty, StringComparison.OrdinalIgnoreCase) &&
-            d.SlotMinutes != doctor.SlotMinutes))
-        {
-            throw new InvalidOperationException("Длительность слота должна быть одинаковой для врачей одной специальности.");
-        }
+    public Doctor AddDoctor(string fullName, string specialty, int slotMinutes) =>
+        doctorStorage.AddDoctor(fullName, specialty, slotMinutes);
 
-        doctors.Add(doctor);
-        return doctor;
+    public IReadOnlyList<string> GetSpecialties() => doctorStorage.GetSpecialties();
+
+    public IReadOnlyList<Doctor> GetDoctors(string specialty) => doctorStorage.GetDoctors(specialty);
+
+    public IReadOnlyList<DateOnly> GetFreeDates(string specialty, int? doctorId = null)
+    {
+        lock (bookingLock)
+        {
+            var currentTime = now();
+            var lastDate = DateOnly.FromDateTime(currentTime).AddDays(14);
+            return Schedule.GetFreeDates(specialty, currentTime, lastDate, doctorId);
+        }
     }
 
     public IReadOnlyList<TimeSlot> CreateSchedule(int doctorId, string cabinetNumber, DateTime start, DateTime end)
     {
         lock (bookingLock)
         {
-            var doctor = doctors.FirstOrDefault(d => d.Id == doctorId)
-                ?? throw new KeyNotFoundException("Врач не найден.");
+            var doctor = doctorStorage.GetDoctor(doctorId);
             if (start <= now())
                 throw new ArgumentException("Расписание создается на будущее время.", nameof(start));
 
@@ -74,7 +72,7 @@ public sealed class Clinic
         // одна блокировка защищает и слот, и ограничение на запись к специальности
         lock (bookingLock)
         {
-            var patient = GetPatient(patientId);
+            var patient = patientStorage.GetPatient(patientId);
             var slot = Schedule.GetSlot(slotId);
             var currentTime = now();
             if (!patient.IsAttached)
@@ -134,7 +132,7 @@ public sealed class Clinic
     {
         lock (bookingLock)
         {
-            var appointment = GetPatient(patientId).Appointments.FirstOrDefault(a => a.Id == appointmentId)
+            var appointment = patientStorage.GetPatient(patientId).Appointments.FirstOrDefault(a => a.Id == appointmentId)
                 ?? throw new KeyNotFoundException("У пациента нет такой записи.");
             if (appointment.Slot.Start - now() < TimeSpan.FromHours(1))
                 throw new InvalidOperationException("Менее чем за час до приема отмена доступна только через регистратуру.");
@@ -142,7 +140,4 @@ public sealed class Clinic
             appointment.Cancel();
         }
     }
-
-    private Patient GetPatient(int patientId) => patients.FirstOrDefault(p => p.Id == patientId)
-        ?? throw new KeyNotFoundException("Пациент не найден.");
 }
