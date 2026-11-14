@@ -10,10 +10,9 @@
 dotnet build src/PoliClick.sln
 dotnet run --project src/PoliClick
 dotnet run --project src/PoliClick -- --queue-demo
-dotnet run --project src/PoliClick.Checks
 ```
 
-Внешних NuGet-пакетов нет. Проверки запускаются отдельной консольной программой `PoliClick.Checks`.
+Внешних NuGet-пакетов нет.
 
 ## Демонстрация записи и приема
 
