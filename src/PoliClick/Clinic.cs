@@ -7,12 +7,14 @@ public sealed class Clinic
     private readonly PatientStorage patientStorage = new();
     private readonly DoctorStorage doctorStorage = new();
     private readonly List<Appointment> appointments = [];
+    private readonly List<QueueBoard> queueBoards = [];
     private readonly Func<DateTime> now;
     private readonly object bookingLock = new();
 
     public SlotStorage Schedule { get; } = new();
     public IReadOnlyList<Patient> Patients => patientStorage.Patients;
     public IReadOnlyList<Doctor> Doctors => doctorStorage.Doctors;
+    public IReadOnlyList<QueueBoard> QueueBoards => queueBoards.AsReadOnly();
 
     // подмена времени нужна для демонстрации и проверок без реального ожидания
     public Clinic(Func<DateTime>? now = null) => this.now = now ?? (() => DateTime.Now);
@@ -115,13 +117,13 @@ public sealed class Clinic
             if (appointment.Slot.Start.Date != currentTime.Date)
                 throw new InvalidOperationException("Прием можно начать только в назначенный день.");
 
-            var inProgress = appointments.Where(a => a.Status == AppointmentStatus.IN_PROGRESS);
-            if (inProgress.Any(a => a.Doctor.Id == doctorId))
-                throw new InvalidOperationException("У врача уже идет другой прием.");
-            if (inProgress.Any(a => a.Patient.Id == appointment.Patient.Id))
-                throw new InvalidOperationException("У пациента уже идет другой прием.");
-            if (inProgress.Any(a => a.CabinetNumber == appointment.CabinetNumber))
-                throw new InvalidOperationException("В кабинете еще идет другой прием.");
+            var occupied = appointments.Where(a => a.Id != appointmentId && OccupiesQueueResources(a, currentTime));
+            if (occupied.Any(a => a.Doctor.Id == doctorId))
+                throw new InvalidOperationException("Врач ведет другой прием или ожидает вызванного пациента.");
+            if (occupied.Any(a => a.Patient.Id == appointment.Patient.Id))
+                throw new InvalidOperationException("Пациент участвует в другом приеме или уже вызван в другой кабинет.");
+            if (occupied.Any(a => a.CabinetNumber == appointment.CabinetNumber))
+                throw new InvalidOperationException("Кабинет занят приемом или ожиданием вызванного пациента.");
 
             appointment.Start(currentTime);
             return appointment;
@@ -140,4 +142,77 @@ public sealed class Clinic
             appointment.Cancel();
         }
     }
+
+    public QueueBoard AddQueueBoard(string id, params string[] cabinetNumbers)
+    {
+        lock (bookingLock)
+        {
+            var board = new QueueBoard(id, cabinetNumbers);
+            if (queueBoards.Any(b => b.Id == board.Id))
+                throw new InvalidOperationException("Табло с таким идентификатором уже есть.");
+            if (queueBoards.Any(b => b.CabinetNumbers.Intersect(board.CabinetNumbers).Any()))
+                throw new InvalidOperationException("Кабинет уже относится к другому табло.");
+
+            queueBoards.Add(board);
+            return board;
+        }
+    }
+
+    public IReadOnlyList<Appointment> UpdateQueue()
+    {
+        lock (bookingLock)
+        {
+            var currentTime = now();
+            foreach (var board in queueBoards)
+                board.Clear();
+
+            var occupied = appointments.Where(a => OccupiesQueueResources(a, currentTime)).ToList();
+            var busyDoctors = occupied.Select(a => a.Doctor.Id).ToHashSet();
+            var busyPatients = occupied.Select(a => a.Patient.Id).ToHashSet();
+            var busyCabinets = occupied.Select(a => a.CabinetNumber).ToHashSet();
+
+            // вызов остается на табло, пока пациент не начал прием или врач не отметил неявку
+            foreach (var waiting in occupied.Where(a => a.Status == AppointmentStatus.PLANNED))
+            {
+                var board = queueBoards.FirstOrDefault(b => b.CabinetNumbers.Contains(waiting.CabinetNumber));
+                board?.ShowCall(waiting.CabinetNumber, waiting.Number);
+            }
+
+            var called = new List<Appointment>();
+            var candidates = appointments.Where(a => a.Status == AppointmentStatus.PLANNED &&
+                    a.CalledAt is null && a.Slot.Start.Date == currentTime.Date && a.Slot.Start <= currentTime)
+                .OrderBy(a => a.Slot.Start).ThenBy(a => a.Id);
+
+            foreach (var appointment in candidates)
+            {
+                var board = queueBoards.FirstOrDefault(b => b.CabinetNumbers.Contains(appointment.CabinetNumber));
+                if (board is null || busyDoctors.Contains(appointment.Doctor.Id) ||
+                    busyPatients.Contains(appointment.Patient.Id) || busyCabinets.Contains(appointment.CabinetNumber))
+                    continue;
+
+                appointment.Call(currentTime);
+                board.ShowCall(appointment.CabinetNumber, appointment.Number);
+                busyDoctors.Add(appointment.Doctor.Id);
+                busyPatients.Add(appointment.Patient.Id);
+                busyCabinets.Add(appointment.CabinetNumber);
+                called.Add(appointment);
+            }
+
+            return called.AsReadOnly();
+        }
+    }
+
+    public void MarkNoShow(int doctorId, int appointmentId)
+    {
+        lock (bookingLock)
+        {
+            var appointment = OpenAppointment(doctorId, appointmentId);
+            appointment.MarkNoShow(now());
+        }
+    }
+
+    private static bool OccupiesQueueResources(Appointment appointment, DateTime currentTime) =>
+        appointment.Status == AppointmentStatus.IN_PROGRESS ||
+        (appointment.Status == AppointmentStatus.PLANNED && appointment.CalledAt is not null &&
+         appointment.Slot.Start.Date == currentTime.Date);
 }

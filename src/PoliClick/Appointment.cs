@@ -7,7 +7,8 @@ public enum AppointmentStatus
     PLANNED,
     IN_PROGRESS,
     COMPLETED,
-    CANCELLED
+    CANCELLED,
+    NO_SHOW
 }
 
 public sealed class Appointment
@@ -25,6 +26,7 @@ public sealed class Appointment
     public bool IsActive => Status is AppointmentStatus.PLANNED or AppointmentStatus.IN_PROGRESS;
     public DateTime? StartedAt { get; private set; }
     public DateTime? FinishedAt { get; private set; }
+    public DateTime? CalledAt { get; private set; }
     public string Complaints { get; private set; } = "";
     public string Anamnesis { get; private set; } = "";
     public string Examination { get; private set; } = "";
@@ -49,6 +51,24 @@ public sealed class Appointment
 
         StartedAt = startedAt;
         Status = AppointmentStatus.IN_PROGRESS;
+    }
+
+    internal void Call(DateTime calledAt)
+    {
+        if (Status != AppointmentStatus.PLANNED || CalledAt is not null)
+            throw new InvalidOperationException("Запись уже вызвана или недоступна для вызова.");
+
+        CalledAt = calledAt;
+    }
+
+    internal void MarkNoShow(DateTime currentTime)
+    {
+        if (Status != AppointmentStatus.PLANNED)
+            throw new InvalidOperationException("Неявку можно отметить только для запланированной записи.");
+        if (currentTime - Slot.Start < TimeSpan.FromMinutes(15))
+            throw new InvalidOperationException("Неявку можно отметить через 15 минут после начала слота.");
+
+        Status = AppointmentStatus.NO_SHOW;
     }
 
     public void SetExamination(string complaints, string anamnesis, string examination)

@@ -3,9 +3,16 @@ using PoliClick;
 
 Console.OutputEncoding = Encoding.UTF8;
 
+if (args.Length == 1 && args[0] == "--queue-demo")
+{
+    await QueueDemo.RunAsync();
+    return 0;
+}
+
 if (args.Length > 0 && (args.Length != 1 || args[0] != "--demo"))
 {
     Console.WriteLine("Запуск демонстрации: dotnet run --project src/PoliClick -- --demo");
+    Console.WriteLine("Автоматическая очередь: dotnet run --project src/PoliClick -- --queue-demo");
     return 1;
 }
 

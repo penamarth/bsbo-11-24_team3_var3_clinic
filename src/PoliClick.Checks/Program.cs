@@ -6,6 +6,254 @@ Console.OutputEncoding = Encoding.UTF8;
 var failed = 0;
 var passed = 0;
 
+Run("Очередь вызывает пациента только после наступления времени слота", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, _, patient, _, day) = CreateScenario(() => clock);
+    var board = clinic.AddQueueBoard("Холл", "101", "102", "103");
+    var appointment = clinic.BookAppointment(patient.Id, 1);
+    clock = day.AddSeconds(-1);
+    Check(clinic.UpdateQueue().Count == 0 && appointment.CalledAt is null && board.Calls.Count == 0, "Пациент вызван раньше времени.");
+    clock = day;
+    var called = clinic.UpdateQueue();
+    Check(called.Count == 1 && called[0] == appointment && appointment.CalledAt == clock, "Вызов не сохранен.");
+    Check(appointment.Status == AppointmentStatus.PLANNED && appointment.StartedAt is null, "Вызов сам начал прием.");
+    Check(board.Calls["101"] == appointment.Number, "На табло неверный номер.");
+});
+
+Run("Ожидание вызванного пациента блокирует следующего без повторов и автоматической неявки", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var board = clinic.AddQueueBoard("Холл", "101");
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, 2);
+    clock = day;
+    clinic.UpdateQueue();
+    var calledAt = first.CalledAt;
+    clock = day.AddMinutes(30);
+    Check(clinic.UpdateQueue().Count == 0 && clinic.UpdateQueue().Count == 0, "Вызов повторяется.");
+    Check(first.CalledAt == calledAt && first.Status == AppointmentStatus.PLANNED && second.CalledAt is null,
+        "Ожидание заменено неявкой или вызван следующий пациент.");
+    Check(board.Calls["101"] == first.Number, "Ожидающий вызов исчез с табло.");
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, second.Id));
+    Check(second.StartedAt is null, "Проверку ожидания можно обойти началом другого приема.");
+});
+
+Run("После начала вызов снимается с табло, затянувшийся прием задерживает следующий", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var board = clinic.AddQueueBoard("Холл", "101");
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, 2);
+    clock = day;
+    clinic.UpdateQueue();
+    clinic.StartAppointment(doctor.Id, first.Id);
+    clock = day.AddMinutes(30);
+    Check(clinic.UpdateQueue().Count == 0 && board.Calls.Count == 0 && second.CalledAt is null, "Следующий вызван в занятый кабинет.");
+    first.SetExamination("Жалобы", "", "Осмотр");
+    first.SetDiagnosis("R69");
+    first.Complete();
+    var called = clinic.UpdateQueue();
+    Check(called.Count == 1 && called[0] == second && board.Calls["101"] == second.Number, "После завершения очередь не продолжилась.");
+});
+
+Run("Два табло независимо обслуживают группы кабинетов без ФИО пациентов", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, _, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var surgeon = clinic.AddDoctor("Хирург", "Хирургия", 20);
+    var ophthalmologist = clinic.AddDoctor("Офтальмолог", "Офтальмология", 20);
+    var surgery = clinic.CreateSchedule(surgeon.Id, "102", day, day.AddMinutes(20))[0];
+    var ophthalmology = clinic.CreateSchedule(ophthalmologist.Id, "201", day, day.AddMinutes(20))[0];
+    var third = clinic.AddPatient("Третий пациент", new DateOnly(1990, 1, 1), "0000000000000003");
+    var firstBoard = clinic.AddQueueBoard("Холл 1", "101", "102", "103");
+    var secondBoard = clinic.AddQueueBoard("Холл 2", "201", "202", "203");
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, surgery.Id);
+    var last = clinic.BookAppointment(third.Id, ophthalmology.Id);
+    clock = day;
+    Check(clinic.UpdateQueue().Count == 3, "Независимые кабинеты блокируют друг друга.");
+    Check(firstBoard.Calls.Count == 2 && firstBoard.Calls["101"] == first.Number && firstBoard.Calls["102"] == second.Number,
+        "Вызовы попали не на свое табло.");
+    Check(secondBoard.Calls.Count == 1 && secondBoard.Calls["201"] == last.Number, "Второе табло показывает чужие вызовы.");
+    Check(firstBoard.Calls.Values.All(number => number.StartsWith("A") && !number.Contains("пациент")), "На табло попали данные пациента.");
+});
+
+Run("Вызванный пациент не вызывается одновременно к другому врачу", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, _, day) = CreateScenario(() => clock);
+    var surgeon = clinic.AddDoctor("Хирург", "Хирургия", 20);
+    var slot = clinic.CreateSchedule(surgeon.Id, "102", day, day.AddMinutes(20))[0];
+    clinic.AddQueueBoard("Холл", "101", "102");
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(patient.Id, slot.Id);
+    clock = day;
+    Check(clinic.UpdateQueue().Single() == first && second.CalledAt is null, "Пациент вызван сразу в два кабинета.");
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(surgeon.Id, second.Id));
+    clock = day.AddMinutes(15);
+    clinic.MarkNoShow(doctor.Id, first.Id);
+    Check(clinic.UpdateQueue().Single() == second, "Занятость пациента не снята после отметки неявки.");
+});
+
+Run("Ожидание блокирует одного врача даже при смене кабинета", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var slot = clinic.CreateSchedule(doctor.Id, "102", day.AddHours(1), day.AddMinutes(80))[0];
+    clinic.AddQueueBoard("Холл", "101", "102");
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, slot.Id);
+    clock = day;
+    clinic.UpdateQueue();
+    clock = day.AddHours(1);
+    Check(clinic.UpdateQueue().Count == 0 && second.CalledAt is null, "Врач ожидает двух пациентов в разных кабинетах.");
+    clinic.MarkNoShow(doctor.Id, first.Id);
+    Check(clinic.UpdateQueue().Single() == second, "Врач не освобожден после отметки неявки.");
+});
+
+Run("Ожидание блокирует кабинет при смене врача", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var surgeon = clinic.AddDoctor("Хирург", "Хирургия", 20);
+    var slot = clinic.CreateSchedule(surgeon.Id, "101", day.AddHours(1), day.AddMinutes(80))[0];
+    clinic.AddQueueBoard("Холл", "101");
+    var first = clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, slot.Id);
+    clock = day;
+    clinic.UpdateQueue();
+    clock = day.AddHours(1);
+    Check(clinic.UpdateQueue().Count == 0 && second.CalledAt is null, "Кабинет ожидает двух пациентов.");
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(surgeon.Id, second.Id));
+    clinic.MarkNoShow(doctor.Id, first.Id);
+    Check(clinic.UpdateQueue().Single() == second, "Кабинет не освобожден после отметки неявки.");
+});
+
+Run("Неявка доступна через 15 минут и не освобождает использованный слот", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var board = clinic.AddQueueBoard("Холл", "101");
+    var absent = clinic.BookAppointment(patient.Id, 1);
+    var next = clinic.BookAppointment(anotherPatient.Id, 2);
+    clock = day;
+    clinic.UpdateQueue();
+    clock = day.AddMinutes(15).AddSeconds(-1);
+    Expect<InvalidOperationException>(() => clinic.MarkNoShow(doctor.Id, absent.Id));
+    Check(absent.Status == AppointmentStatus.PLANNED, "Неявка отмечена раньше срока.");
+    clock = day.AddMinutes(15);
+    clinic.MarkNoShow(doctor.Id, absent.Id);
+    Check(absent.Status == AppointmentStatus.NO_SHOW && absent.StartedAt is null && absent.FinishedAt is null,
+        "Неявка создала фактический прием.");
+    Check(!absent.Slot.IsFree && !patient.HasActiveAppointment(doctor.Specialty) && patient.GetMedicalHistory().Count == 0,
+        "Неявка неверно обработана в расписании или истории.");
+    Expect<InvalidOperationException>(() => clinic.MarkNoShow(doctor.Id, absent.Id));
+    Expect<InvalidOperationException>(() => clinic.StartAppointment(doctor.Id, absent.Id));
+    Check(clinic.UpdateQueue().Count == 0 && board.Calls.Count == 0, "Следующий пациент вызван раньше своего времени.");
+    clock = next.Slot.Start;
+    Check(clinic.UpdateQueue().Single() == next, "Очередь не продолжилась после неявки.");
+});
+
+Run("Неявку не может отметить другой врач, а начатый и закрытый прием не меняются", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var surgeon = clinic.AddDoctor("Хирург", "Хирургия", 20);
+    var cancelled = clinic.BookAppointment(patient.Id, 1);
+    clinic.CancelAppointment(patient.Id, cancelled.Id);
+    var appointment = clinic.BookAppointment(anotherPatient.Id, 1);
+    clock = day.AddMinutes(20);
+    Expect<InvalidOperationException>(() => clinic.MarkNoShow(surgeon.Id, appointment.Id));
+    Expect<KeyNotFoundException>(() => clinic.MarkNoShow(doctor.Id, int.MaxValue));
+    Expect<InvalidOperationException>(() => clinic.MarkNoShow(doctor.Id, cancelled.Id));
+    clinic.StartAppointment(doctor.Id, appointment.Id);
+    Expect<InvalidOperationException>(() => clinic.MarkNoShow(doctor.Id, appointment.Id));
+    appointment.SetExamination("Жалобы", "", "Осмотр");
+    appointment.SetDiagnosis("R69");
+    appointment.Complete();
+    Expect<InvalidOperationException>(() => clinic.MarkNoShow(doctor.Id, appointment.Id));
+    Check(appointment.Status == AppointmentStatus.COMPLETED && cancelled.Status == AppointmentStatus.CANCELLED,
+        "Отказ в отметке неявки изменил данные.");
+});
+
+Run("Очередь игнорирует отмененные записи, другие дни и кабинеты без табло", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var cancelled = clinic.BookAppointment(patient.Id, 1);
+    clinic.CancelAppointment(patient.Id, cancelled.Id);
+    var today = clinic.BookAppointment(anotherPatient.Id, 2);
+    var futureSlot = clinic.CreateSchedule(doctor.Id, "101", day.AddDays(1), day.AddDays(1).AddMinutes(20))[0];
+    var future = clinic.BookAppointment(patient.Id, futureSlot.Id);
+    clock = day.AddMinutes(20);
+    Check(clinic.UpdateQueue().Count == 0 && today.CalledAt is null, "Вызов отправлен без табло.");
+    clinic.AddQueueBoard("Холл", "101");
+    Check(clinic.UpdateQueue().Single() == today && cancelled.CalledAt is null && future.CalledAt is null,
+        "Очередь выбрала отмененную или будущую запись.");
+});
+
+Run("Вчерашний ожидающий вызов не остается на табло и не блокирует новый день", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, doctor, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var pastSlot = clinic.CreateSchedule(doctor.Id, "101", day.AddDays(-1), day.AddDays(-1).AddMinutes(20))[0];
+    var past = clinic.BookAppointment(patient.Id, pastSlot.Id);
+    var today = clinic.BookAppointment(anotherPatient.Id, 1);
+    var board = clinic.AddQueueBoard("Холл", "101");
+    clock = past.Slot.Start;
+    Check(clinic.UpdateQueue().Single() == past, "Не появился первый вызов.");
+    clock = day;
+    Check(clinic.UpdateQueue().Single() == today && board.Calls["101"] == today.Number, "Вчерашний вызов блокирует новый день.");
+    Check(past.Status == AppointmentStatus.PLANNED, "Очередь самовольно отметила вчерашнюю неявку.");
+});
+
+Run("Табло не допускают пустые группы, повторные идентификаторы и общие кабинеты", () =>
+{
+    var clinic = new Clinic();
+    var board = clinic.AddQueueBoard(" Холл ", " 101 ", "102");
+    Check(board.Id == "Холл" && board.CabinetNumbers.SequenceEqual(new[] { "101", "102" }), "Не убраны пробелы.");
+    Expect<InvalidOperationException>(() => clinic.AddQueueBoard("Холл", "201"));
+    Expect<InvalidOperationException>(() => clinic.AddQueueBoard("Другой", "101"));
+    Expect<ArgumentException>(() => clinic.AddQueueBoard("" , "201"));
+    Expect<ArgumentException>(() => clinic.AddQueueBoard("Пустой"));
+    Expect<ArgumentException>(() => clinic.AddQueueBoard("Повтор", "201", " 201 "));
+    Expect<ArgumentException>(() => clinic.AddQueueBoard("Пробел", " "));
+    Check(clinic.QueueBoards.Count == 1, "Некорректное табло было добавлено.");
+});
+
+Run("Из нескольких опоздавших записей первой вызывается самая ранняя по времени слота", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, _, patient, anotherPatient, day) = CreateScenario(() => clock);
+    var third = clinic.AddPatient("Третий пациент", new DateOnly(1990, 1, 1), "0000000000000003");
+    clinic.AddQueueBoard("Холл", "101");
+    clinic.BookAppointment(patient.Id, 3);
+    var earliest = clinic.BookAppointment(anotherPatient.Id, 1);
+    clinic.BookAppointment(third.Id, 2);
+    clock = day.AddHours(1);
+    Check(clinic.UpdateQueue().Single() == earliest, "Порядок создания записей заменил порядок слотов.");
+});
+
+Run("Параллельные обновления очереди не создают повторных вызовов", () =>
+{
+    var clock = new DateTime(2030, 1, 10, 8, 0, 0);
+    var (clinic, _, patient, anotherPatient, day) = CreateScenario(() => clock);
+    clinic.AddQueueBoard("Холл", "101");
+    clinic.BookAppointment(patient.Id, 1);
+    var second = clinic.BookAppointment(anotherPatient.Id, 2);
+    clock = day.AddMinutes(30);
+    var called = new ConcurrentBag<Appointment>();
+    Parallel.For(0, 8, _ =>
+    {
+        foreach (var appointment in clinic.UpdateQueue())
+            called.Add(appointment);
+    });
+    Check(called.Count == 1 && second.CalledAt is null, "Параллельные обновления создали несколько вызовов.");
+});
+
 Run("Специальности не повторяются, врачи отбираются по специальности и сортируются по ФИО", () =>
 {
     var (clinic, doctor, _, _, _) = CreateScenario();
